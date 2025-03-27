@@ -18,18 +18,24 @@ class GeneEncoder(nn.Module):
         return self.fc(x)
 
 class PathwayEncoder(nn.Module):
-    def __init__(self, in_feats: int = 3, embed_dim: int = 32):
+    def __init__(self, in_feats: int = 4, hidden_dim: int = 32, embed_dim: int = 32):
         super().__init__()
-        self.conv1 = GCNConv(in_feats, 16)
-        self.conv2 = GCNConv(16, embed_dim)
+        self.conv1 = GCNConv(in_feats, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, embed_dim)
+        self.dropout = nn.Dropout(0.2)
 
     def forward(self, data) -> torch.Tensor:
         x, edge_index = data.x, data.edge_index
-        batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        x = checkpoint(self.conv1, x, edge_index)
+        if hasattr(data, 'batch') and data.batch is not None:
+            batch = data.batch
+        else:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        x = self.conv1(x, edge_index)
         x = F.relu(x)
-        x = checkpoint(self.conv2, x, edge_index)
+        x = self.dropout(x)
+        x = self.conv2(x, edge_index)
         x = global_mean_pool(x, batch)
+        
         return x
 
 class FusionModel(nn.Module):

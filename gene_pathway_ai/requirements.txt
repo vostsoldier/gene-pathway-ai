@@ -1,8 +1,26 @@
-torch>=1.13.0
-torchvision
-torch-geometric
-numpy
-pandas
-scikit-learn
-wandb
-pyyaml
+# Core dependencies
+torch==2.0.1
+torchvision==0.15.2
+torch-geometric==2.3.1
+numpy==1.24.3
+pandas==2.0.2
+scikit-learn==1.2.2
+tqdm==4.65.0
+
+# Graph dependencies 
+networkx==3.1
+
+# KEGG pathway parsing
+biopython==1.81
+
+# Visualization
+matplotlib==3.7.1
+seaborn==0.12.2
+umap-learn==0.5.3
+
+# Logging and configuration
+pyyaml==6.0
+wandb==0.15.4
+
+# Testing
+pytest==7.3.1

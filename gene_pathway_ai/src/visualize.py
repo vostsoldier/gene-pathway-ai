@@ -6,7 +6,7 @@ try:
 except ImportError:
     raise ImportError("Please install umap-learn: pip install umap-learn")
 
-def visualize_latent_space(embeddings: np.ndarray, labels: np.ndarray, gene_names=None):
+def visualize_latent_space(embeddings: np.ndarray, labels: np.ndarray, gene_names=None, filename="results/umap.png"):
     reducer = UMAP(n_neighbors=min(15, len(embeddings)-1), min_dist=0.1, metric='euclidean')
     embeddings_2d = reducer.fit_transform(embeddings)
     
@@ -39,5 +39,5 @@ def visualize_latent_space(embeddings: np.ndarray, labels: np.ndarray, gene_name
     plt.xlabel("UMAP Dimension 1")
     plt.ylabel("UMAP Dimension 2")
     os.makedirs("results", exist_ok=True)
-    plt.savefig("results/umap.png", dpi=300, bbox_inches='tight')
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
     plt.close()
