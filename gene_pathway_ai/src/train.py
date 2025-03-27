@@ -2,38 +2,78 @@ import argparse
 import csv
 import os
 from typing import Dict, List, Tuple
-
+import glob
 import torch
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split, WeightedRandomSampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import torch_geometric
 import numpy as np
-
-from data_loader import load_gene_sequences, load_pathway_graph
+from data_loader import load_gene_sequences, load_pathway_graph, load_genes_from_dir
 from model import FusionModel
 from utils import seq_to_onehot, check_cuda
 from visualize import visualize_latent_space
 
-def prepare_data(gene_files: List[str], pathway_file: str, labels: List[int]) -> Tuple[DataLoader, DataLoader]:
+def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str) -> Tuple[DataLoader, DataLoader, torch.Tensor, List[str]]:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     pathway_data = load_pathway_graph(pathway_file)
+    pos_genes = load_genes_from_dir(pos_dir)
+    neg_genes = load_genes_from_dir(neg_dir)
+    
+    print(f"Loaded {len(pos_genes)} positive genes and {len(neg_genes)} negative genes")
     gene_tensors = []
-    for gene_file in gene_files:
-        seq = load_gene_sequences(gene_file)
+    gene_names = []
+    labels = []
+    
+    for gene_name, seq in pos_genes:
+        assert ">" not in seq, f"Header character '>' found in sequence from {gene_name}"
+        assert len(seq) == 10000, f"Sequence length mismatch for {gene_name}: {len(seq)} != 10000"
+        
         gene_tensors.append(seq_to_onehot(seq))
+        gene_names.append(gene_name)
+        labels.append(1)  
+    for gene_name, seq in neg_genes:
+        assert ">" not in seq, f"Header character '>' found in sequence from {gene_name}"
+        assert len(seq) == 10000, f"Sequence length mismatch for {gene_name}: {len(seq)} != 10000"
+        
+        gene_tensors.append(seq_to_onehot(seq))
+        gene_names.append(gene_name)
+        labels.append(0) 
+    
     genes_batch = torch.stack(gene_tensors)
     labels_tensor = torch.tensor(labels, dtype=torch.float).view(-1, 1)
     dataset = TensorDataset(genes_batch, labels_tensor)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    
+    train_dataset, val_dataset = random_split(
+        dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42) 
+    )
+    train_indices = train_dataset.indices
+    train_labels = [labels[idx] for idx in train_indices]
+    
+    pos_count = sum(1 for l in train_labels if l == 1)
+    neg_count = sum(1 for l in train_labels if l == 0)
+    if pos_count > 0 and neg_count > 0: 
+        class_weights = [1.0/neg_count if l == 0 else 1.0/pos_count for l in train_labels]
+        sample_weights = torch.FloatTensor(class_weights)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+        train_loader = DataLoader(train_dataset, batch_size=4, sampler=sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+
     val_loader = DataLoader(val_dataset, batch_size=4)
     
-    return train_loader, val_loader, pathway_data
+    return train_loader, val_loader, pathway_data, gene_names
 
 def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, accumulation_steps):
     model.train()
@@ -112,31 +152,24 @@ def gather_latent_space(model, data_loader, device, pathway_data=None):
     return all_embeddings, all_labels
 
 def main(args: Dict) -> None:
+    """Main training function"""
     check_cuda()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs("results", exist_ok=True)
-    all_gene_files = []
-    if hasattr(args, 'pos_genes') and args.pos_genes:
-        all_gene_files.extend(args.pos_genes)
-    elif hasattr(args, 'fasta_path'):
-        all_gene_files.append(args.fasta_path)
-        
-    if hasattr(args, 'neg_genes') and args.neg_genes:
-        all_gene_files.extend(args.neg_genes)
-    pos_count = len(args.pos_genes) if hasattr(args, 'pos_genes') and args.pos_genes else 1
-    neg_count = len(args.neg_genes) if hasattr(args, 'neg_genes') and args.neg_genes else 0
-    labels = [1] * pos_count + [0] * neg_count
     
-    pathway_path = args.pathway if hasattr(args, 'pathway') else args.kegg_path
+    train_loader, val_loader, pathway_data, gene_names = prepare_data(
+        args.pos_dir,
+        args.neg_dir,
+        args.pathway
+    )
     
-    train_loader, val_loader, pathway_data = prepare_data(all_gene_files, pathway_path, labels)
     pathway_data = pathway_data.to(device)
     sample_batch = next(iter(train_loader))
-    seq_len = sample_batch[0].shape[2]  
+    seq_len = sample_batch[0].shape[2] 
     model = FusionModel(seq_len=seq_len).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scaler = GradScaler()
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = torch.nn.BCEWithLogitsLoss()  
     with open("results/training_log.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_loss", "val_accuracy", "val_precision", "val_recall", "val_f1"])
@@ -144,7 +177,7 @@ def main(args: Dict) -> None:
     best_val_loss = float('inf')
     patience = 5
     patience_counter = 0
-    accumulation_steps = 4
+    accumulation_steps = args.accumulation_steps
 
     for epoch in range(args.epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, accumulation_steps)
@@ -163,16 +196,18 @@ def main(args: Dict) -> None:
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
-
         if epoch % 5 == 0:  
             all_embeddings, all_labels = gather_latent_space(model, val_loader, device, pathway_data)
-            visualize_latent_space(all_embeddings, all_labels)
+            visualize_latent_space(all_embeddings, all_labels, gene_names=gene_names)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Gene-Pathway Prediction Model")
     parser.add_argument("--epochs", type=int, default=50, help="Maximum number of training epochs")
-    parser.add_argument("--pos_genes", type=str, nargs="+", help="Path(s) to positive gene FASTA files")
-    parser.add_argument("--neg_genes", type=str, nargs="+", help="Path(s) to negative gene FASTA files")
-    parser.add_argument("--pathway", type=str, default="src/data/dna_repair_graph.tsv", help="Path to pathway data")
+    parser.add_argument("--pos_dir", type=str, required=True, help="Directory with positive gene files")
+    parser.add_argument("--neg_dir", type=str, required=True, help="Directory with negative gene files")
+    parser.add_argument("--pathway", type=str, required=True, help="Path to pathway graph TSV/KGML file")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
+    
     args = parser.parse_args()
     main(args)
