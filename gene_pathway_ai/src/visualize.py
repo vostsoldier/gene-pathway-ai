@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 try:
-    import umap
+    from umap import UMAP  
 except ImportError:
     raise ImportError("Please install umap-learn: pip install umap-learn")
 
@@ -11,7 +11,7 @@ def visualize_latent_space(embeddings: np.ndarray, labels: np.ndarray):
     embeddings shape: [num_samples, embed_dim]
     labels shape: [num_samples], e.g. class labels or metadata
     """
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean')
+    reducer = UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean')
     embeddings_2d = reducer.fit_transform(embeddings)
     
     plt.figure(figsize=(6, 6))
