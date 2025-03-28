@@ -181,8 +181,6 @@ def gather_latent_space(model, data_loader, device, pathway_data=None):
 
 def visualize_all_genes(model, train_loader, val_loader, device, pathway_data, gene_names):
     print("Creating full gene comparison visualization...")
-    
-    # Create a dataset with all genes
     full_dataset = ConcatDataset([
         train_loader.dataset, 
         val_loader.dataset
@@ -215,25 +213,29 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
     if preloaded_pathway_data is not None:
         pathway_data = preloaded_pathway_data
         train_loader, val_loader, _, gene_names = prepare_data(
-            args.pos_dir, 
-            args.neg_dir, 
-            None, 
-            preloaded_pathway_data
+            args.pos_dir, args.neg_dir, None, preloaded_pathway_data
         )
     else:
         train_loader, val_loader, pathway_data, gene_names = prepare_data(
-            args.pos_dir,
-            args.neg_dir,
-            args.pathway
+            args.pos_dir, args.neg_dir, args.pathway
         )
     pathway_data = pathway_data.to(device)
-    
     sample_batch = next(iter(train_loader))
-    seq_len = sample_batch[0].shape[2] 
-    model = FusionModel(seq_len=seq_len).to(device)
+    seq_len = sample_batch[0].shape[2]
+    pathway_feat_dim = pathway_data.x.shape[1]  
+    model = FusionModel(
+        seq_len=seq_len, 
+        pathway_feat_dim=pathway_feat_dim,
+        embed_dim=64,
+        hidden_dim=64
+    ).to(device)
+    
+    print(f"Model initialized with sequence length {seq_len} and {pathway_feat_dim} pathway features")
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scaler = GradScaler()
-    criterion = torch.nn.BCEWithLogitsLoss()  
+    pos_weight = None
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
     with open("results/training_log.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_loss", "val_accuracy", "val_precision", "val_recall", "val_f1"])

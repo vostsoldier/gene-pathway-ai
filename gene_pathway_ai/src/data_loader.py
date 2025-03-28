@@ -105,6 +105,7 @@ def load_pathway_graph(kegg_path: str) -> Data:
     x = torch.tensor(x_list, dtype=torch.float)
     data = Data(x=x, edge_index=edge_index)
     return data
+
 def load_kegg_pathway(pathway_id: str = "hsa03440", local_file: str = None) -> Data:
     if local_file and os.path.exists(local_file):
         print(f"Loading KEGG pathway from local file: {local_file}")
@@ -113,127 +114,151 @@ def load_kegg_pathway(pathway_id: str = "hsa03440", local_file: str = None) -> D
     else:
         print(f"Downloading KEGG pathway: {pathway_id}")
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".xml")
-        temp_file.close() 
+        temp_file.close()  
         url = f"https://rest.kegg.jp/get/{pathway_id}/kgml"
         urllib.request.urlretrieve(url, temp_file.name)
         kgml_file = temp_file.name
-    tree = ET.parse(kgml_file)
-    root = tree.getroot()
-    G = nx.DiGraph()
-    entries = {}
-    for entry in root.findall("./entry"):
-        entry_id = entry.get("id")
-        name = entry.get("name")
-        entry_type = entry.get("type")
-        
-        gene_names = name.replace("hsa:", "").split()
-        primary_gene = gene_names[0] if gene_names else f"node_{entry_id}"
-        
-        entries[entry_id] = {
-            "id": entry_id,
-            "name": primary_gene,
-            "type": entry_type,
-            "all_genes": gene_names
-        }
-        G.add_node(entry_id, name=primary_gene, type=entry_type, all_genes=gene_names)
-    
-    relations = []
-    for relation in root.findall("./relation"):
-        entry1 = relation.get("entry1")
-        entry2 = relation.get("entry2")
-        rel_type = relation.get("type")
-        if entry1 not in entries or entry2 not in entries:
-            continue
-        subtype = "undefined"
-        effect = 0 
-        
-        subtype_elem = relation.find("./subtype")
-        if subtype_elem is not None:
-            subtype = subtype_elem.get("name")
-            activation_types = ["activation", "expression", "phosphorylation", "indirect effect", "binding/association"]
-            inhibition_types = ["inhibition", "repression", "dephosphorylation", "dissociation", "ubiquitination"]
+    try:
+        tree = ET.parse(kgml_file)
+        root = tree.getroot()
+        G = nx.DiGraph(name=pathway_id)
+        entries: Dict[str, Dict[str, Any]] = {}
+        for entry in root.findall("./entry"):
+            entry_id = entry.get("id")
+            name = entry.get("name")
+            entry_type = entry.get("type", "undefined")
+            gene_names = name.replace("hsa:", "").split()
+            primary_gene = gene_names[0] if gene_names else f"node_{entry_id}"
+            ec_number = None
+            for graphics in entry.findall("./graphics"):
+                if "name" in graphics.attrib:
+                    name_text = graphics.get("name", "")
+                    if "EC:" in name_text:
+                        ec_parts = name_text.split("EC:")
+                        if len(ec_parts) > 1:
+                            ec_number = ec_parts[1].strip()
+            entries[entry_id] = {
+                "id": entry_id,
+                "name": primary_gene,
+                "type": entry_type,
+                "all_genes": gene_names,
+                "ec_number": ec_number
+            }
             
-            if subtype in activation_types:
-                effect = 1 
-            elif subtype in inhibition_types:
-                effect = -1  
-        G.add_edge(entry1, entry2, type=rel_type, subtype=subtype, effect=effect)
+            G.add_node(entry_id, name=primary_gene, type=entry_type, 
+                       all_genes=gene_names, ec_number=ec_number)
         
-        relations.append({
-            "source": entries[entry1]["name"],
-            "target": entries[entry2]["name"],
-            "type": rel_type,
-            "subtype": subtype,
-            "effect": effect
-        })
-    
-    degree_centrality = nx.degree_centrality(G)
-    betweenness_centrality = nx.betweenness_centrality(G)
-    node_names = []
-    node_features = []
-    
-    for node_id in G.nodes():
-        node_data = G.nodes[node_id]
-        node_names.append(node_data["name"])
-        outgoing_edges = list(G.out_edges(node_id))
-        if outgoing_edges:
-            avg_effect = sum(G[u][v]["effect"] for u, v in outgoing_edges) / len(outgoing_edges)
-        else:
-            avg_effect = 0
-        if node_data["type"] == "gene":
-            type_code = 0
-        elif node_data["type"] == "compound":
-            type_code = 1
-        else:
-            type_code = 2
-        features = [
-            degree_centrality[node_id],
-            avg_effect,
-            type_code,
-            betweenness_centrality[node_id]
-        ]
-        
-        node_features.append(features)
-    edges = []
-    edge_features = []
-    
-    for u, v, data in G.edges(data=True):
-        u_idx = list(G.nodes()).index(u)
-        v_idx = list(G.nodes()).index(v)
-        
-        edges.append([u_idx, v_idx])
-        if data["type"] == "PPrel":  
-            rel_type_code = 0
-        elif data["type"] == "GErel": 
-            rel_type_code = 1
-        elif data["type"] == "PCrel": 
-            rel_type_code = 2
-        else:
-            rel_type_code = 3
+        for relation in root.findall("./relation"):
+            entry1 = relation.get("entry1")
+            entry2 = relation.get("entry2")
+            rel_type = relation.get("type", "undefined")
             
-        edge_feat = [
-            data["effect"], 
-            rel_type_code
-        ]
+            if entry1 not in entries or entry2 not in entries:
+                continue
+            
+            subtypes = []
+            effect = 0 
+            
+            for subtype_elem in relation.findall("./subtype"):
+                subtype_name = subtype_elem.get("name", "undefined")
+                subtypes.append(subtype_name)
+                
+                activation_subtypes = ["activation", "expression", "phosphorylation", 
+                                     "indirect effect", "binding/association"]
+                inhibition_subtypes = ["inhibition", "repression", "dephosphorylation", 
+                                     "ubiquitination", "methylation"]
+                
+                if subtype_name in activation_subtypes:
+                    effect = 1.0  
+                elif subtype_name in inhibition_subtypes:
+                    effect = -1.0 
+            subtype_str = "|".join(subtypes) if subtypes else "undefined"
+            G.add_edge(entry1, entry2, type=rel_type, subtypes=subtypes,
+                      subtype_str=subtype_str, effect=effect)
+        degree_centrality = nx.degree_centrality(G)
+        betweenness_centrality = nx.betweenness_centrality(G)
+        subtype_to_idx = {}
+        idx_counter = 0
+        for _, _, edge_data in G.edges(data=True):
+            for subtype in edge_data.get("subtypes", []):
+                if subtype not in subtype_to_idx:
+                    subtype_to_idx[subtype] = idx_counter
+                    idx_counter += 1
+        node_names = []
+        node_features = []
+        for node_id in G.nodes():
+            node_data = G.nodes[node_id]
+            node_names.append(node_data["name"])
+            if node_data["type"] == "gene":
+                type_code = 0
+            elif node_data["type"] == "compound":
+                type_code = 1
+            else:
+                type_code = 2
+            outgoing_edges = list(G.out_edges(node_id, data=True))
+            if outgoing_edges:
+                effects = [e[2].get("effect", 0) for e in outgoing_edges]
+                avg_effect = sum(effects) / len(effects)
+            else:
+                avg_effect = 0
+            has_ec = 1.0 if node_data.get("ec_number") else 0.0
+            features = [
+                degree_centrality[node_id], 
+                has_ec,                    
+                avg_effect,                
+                betweenness_centrality[node_id] 
+            ]
+            
+            node_features.append(features)
+        edge_index = []
+        edge_features = []
         
-        edge_features.append(edge_feat)
-    x = torch.tensor(node_features, dtype=torch.float)
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-    edge_attr = torch.tensor(edge_features, dtype=torch.float)
-    data = Data(
-        x=x, 
-        edge_index=edge_index, 
-        edge_attr=edge_attr,
-        node_names=node_names
-    )
-    
-    print(f"KEGG pathway graph: {len(node_names)} nodes, {len(edges)} edges")
-    print(f"Node feature dimensions: {x.shape}")
-    print(f"Edge feature dimensions: {edge_attr.shape}")
-    if temp_file:
-        try:
-            os.unlink(temp_file.name)
-        except (PermissionError, OSError):
-            print(f"Note: Could not delete temporary file, it will be automatically removed later")
-    
-    return data
+        for u, v, data in G.edges(data=True):
+            u_idx = list(G.nodes()).index(u)
+            v_idx = list(G.nodes()).index(v)
+            
+            edge_index.append([u_idx, v_idx])
+            rel_type = data.get("type", "undefined")
+            if rel_type == "PPrel":   
+                rel_type_code = 0
+            elif rel_type == "GErel":  
+                rel_type_code = 1
+            elif rel_type == "PCrel":   
+                rel_type_code = 2  
+            elif rel_type == "ECrel":    
+                rel_type_code = 3
+            else:
+                rel_type_code = 4
+                
+            edge_feat = [
+                data.get("effect", 0), 
+                rel_type_code         
+            ]
+            
+            edge_features.append(edge_feat)
+
+        x = torch.tensor(node_features, dtype=torch.float)
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_features, dtype=torch.float)
+        data = Data(
+            x=x, 
+            edge_index=edge_index, 
+            edge_attr=edge_attr,
+            node_names=node_names
+        )
+        
+        print(f"KEGG pathway graph: {len(node_names)} nodes, {len(edge_index[0])} edges")
+        print(f"Node feature dimensions: {x.shape}")
+        print(f"Edge feature dimensions: {edge_attr.shape}")
+        
+        return data
+        
+    except Exception as e:
+        print(f"Error processing KEGG pathway: {e}")
+        raise
+    finally:
+        if temp_file:
+            try:
+                os.unlink(temp_file.name)
+            except (PermissionError, OSError):
+                print(f"Note: Could not delete temporary file, it will be removed later")
