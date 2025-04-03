@@ -1,25 +1,25 @@
 # Core dependencies
-torch==2.0.1
-torchvision==0.15.2
-torch-geometric==2.3.1
-numpy==1.24.3
-pandas==2.0.2
-scikit-learn==1.2.2
-tqdm==4.65.0
-networkx==3.1
+torch
+torchvision
+torch-geometric
+numpy
+pandas
+scikit-learn
+tqdm
+networkx
 
 # KEGG pathway parsing
-biopython==1.81
-lxml==4.9.3
+biopython
+lxml
 
 # Visualization
-matplotlib==3.7.1
-seaborn==0.12.2
-umap-learn==0.5.3
+matplotlib
+seaborn
+umap-learn
 
 # Logging and configuration
-pyyaml==6.0
-wandb==0.15.4
+pyyaml
+wandb
 
 # Testing
-pytest==7.3.1
+pytest

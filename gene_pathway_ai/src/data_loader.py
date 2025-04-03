@@ -262,3 +262,62 @@ def load_kegg_pathway(pathway_id: str = "hsa03440", local_file: str = None) -> D
                 os.unlink(temp_file.name)
             except (PermissionError, OSError):
                 print(f"Note: Could not delete temporary file, it will be removed later")
+
+def augment_sequence(seq: str, mutation_rate: float = 0.1) -> str:
+    if not seq:
+        return seq
+        
+    if mutation_rate <= 0:
+        return seq
+        
+    nucleotides = ['A', 'T', 'G', 'C']
+    seq_list = list(seq.upper())
+    seq_length = len(seq_list)
+    
+    num_mutations = max(1, int(seq_length * mutation_rate))
+    
+    positions = random.sample(range(seq_length), num_mutations)
+    
+    for pos in positions:
+        current = seq_list[pos]
+        alternatives = [n for n in nucleotides if n != current]
+        
+        if current not in nucleotides:
+            seq_list[pos] = random.choice(nucleotides)
+        else:
+            seq_list[pos] = random.choice(alternatives)
+    
+    mutated_seq = ''.join(seq_list)
+    assert len(mutated_seq) == len(seq), "Mutated sequence length must match original"
+    
+    return mutated_seq
+
+
+def test_augmentation():
+    sample_seq = "ATGCATGCATGCATGCATGC" * 5 
+    augmented = augment_sequence(sample_seq, mutation_rate=0.1)
+    
+    print(f"Original length: {len(sample_seq)}")
+    print(f"Augmented length: {len(augmented)}")
+    
+    diff_count = sum(1 for a, b in zip(sample_seq, augmented) if a != b)
+    diff_percentage = diff_count / len(sample_seq) * 100
+    
+    print(f"Differences: {diff_count} ({diff_percentage:.1f}%)")
+    print(f"Expected mutations: {int(len(sample_seq) * 0.1)}")
+    
+    brca1_path = "src/data/pos_genes/BRCA1.txt"
+    if os.path.exists(brca1_path):
+        with open(brca1_path, "r") as f:
+            brca1_seq = f.read().strip()
+        
+        augmented_brca1 = augment_sequence(brca1_seq, mutation_rate=0.1)
+        print(f"\nBRCA1 original length: {len(brca1_seq)}")
+        print(f"BRCA1 augmented length: {len(augmented_brca1)}")
+        
+        assert len(brca1_seq) == len(augmented_brca1), "Lengths must match"
+        print("BRCA1 augmentation validation: PASSED")
+
+
+if __name__ == "__main__":
+    test_augmentation()

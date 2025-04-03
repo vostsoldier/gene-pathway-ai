@@ -17,7 +17,7 @@ git clone https://github.com/vostsoldier/secret.git
 cd secret/gene_pathway_ai
 
 # Install dependencies
-pip install -r [requirements.txt](http://_vscodecontentref_/6)
+pip install -r requirements.txt(http://_vscodecontentref_/6)
 
 # Basic training with KEGG pathway (downloads hsa03440 DNA repair pathway)
 python src/train.py \
