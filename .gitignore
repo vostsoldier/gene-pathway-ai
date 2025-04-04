@@ -1,2 +1,3 @@
 results/best_model.pt
+*.pt
 results/best_model.pt

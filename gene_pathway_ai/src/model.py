@@ -81,26 +81,28 @@ class CrossModalAttentionLayer(nn.Module):
     
     def forward(self, gene_embedding, pathway_node_features):
         batch_size = gene_embedding.size(0)
-        pathway_nodes = pathway_node_features.unsqueeze(0).expand(batch_size, -1, -1)  
-        Q = self.query_proj(gene_embedding).unsqueeze(1) 
-        K = self.key_proj(pathway_nodes)                
-        V = self.value_proj(pathway_nodes)            
-        scores = torch.matmul(Q, K.transpose(1, 2))     
-        attn_weights = self.softmax(scores)            
-        attn_output = torch.matmul(attn_weights, V)         
-        return attn_output.squeeze(1), attn_weights.squeeze(1) 
+        pathway_nodes = pathway_node_features.unsqueeze(0).expand(batch_size, -1, -1)
+        Q = self.query_proj(gene_embedding).unsqueeze(1)
+        K = self.key_proj(pathway_nodes)
+        V = self.value_proj(pathway_nodes)
+        scores = torch.matmul(Q, K.transpose(1, 2))
+        attn_weights = self.softmax(scores)
+        attn_output = torch.matmul(attn_weights, V)
+        return attn_output.squeeze(1), attn_weights.squeeze(1)
 
 class FusionModel(nn.Module):
     def __init__(self, gene_dim: int = 256, pathway_dim: int = 256, 
                  hidden_dims: list = [128, 64], output_dim: int = 1,
                  use_gradient_checkpointing: bool = False, seq_len: int = 512,
-                 embed_dim: int = None, hidden_dim: int = None,
-                 pathway_data: Optional[object] = None):
+                 embed_dim: Optional[int] = None, hidden_dim: Optional[int] = None,
+                 pathway_data: Optional[object] = None, use_disease_data: bool = False,
+                 disease_emb_dim: int = 16):
         super().__init__()
         if embed_dim is not None:
             gene_dim = embed_dim
         if hidden_dim is not None:
             hidden_dims = [hidden_dim, hidden_dim // 2]
+        self.use_disease_data = use_disease_data
         self.gene_enc = DNABERTEncoder(
             output_dim=gene_dim, 
             use_gradient_checkpointing=use_gradient_checkpointing,
@@ -120,25 +122,46 @@ class FusionModel(nn.Module):
             out_channels=pathway_dim
         )
         self.cross_attn = CrossModalAttentionLayer(gene_dim, pathway_dim, attn_dim=gene_dim)
+        
+        if self.use_disease_data:
+            self.disease_encoder = nn.Sequential(
+                nn.Linear(1, disease_emb_dim),
+                nn.ReLU()
+            )
+            mlp_input_dim = gene_dim + gene_dim + disease_emb_dim
+        else:
+            mlp_input_dim = gene_dim + gene_dim
         layers = []
-        input_dim = gene_dim + gene_dim  
-        dims = [input_dim] + hidden_dims
+        dims = [mlp_input_dim] + hidden_dims
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(nn.BatchNorm1d(dims[i + 1]))
             layers.append(nn.ReLU())
         layers.append(nn.Linear(dims[-1], output_dim))
         self.mlp = nn.Sequential(*layers)
-    
-    def forward(self, gene_seq: torch.Tensor, pathway_data) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gene_embedding = self.gene_enc(gene_seq)  # e.g., [batch, gene_dim]
+        
+    def forward(self, gene_seq: torch.Tensor, pathway_data, gene_names: Optional[List[str]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gene_embedding = self.gene_enc(gene_seq)
         if gene_embedding.dim() > 2:
             gene_embedding = gene_embedding.mean(dim=1)
-        pathway_nodes = self.pathway_enc(pathway_data, return_node_features=True)  # [num_nodes, pathway_dim]
+        pathway_nodes = self.pathway_enc(pathway_data, return_node_features=True)
         cross_output, attn_weights = self.cross_attn(gene_embedding, pathway_nodes)
         if cross_output.dim() > 2:
             cross_output = cross_output.mean(dim=1)
-        combined = torch.cat([gene_embedding, cross_output], dim=1)  # [batch, 2*gene_dim]
+        
+        if self.use_disease_data and gene_names is not None:
+            from gene_pathway_ai.src.ensembl_api import get_gene_disease_associations
+            disease_counts = []
+            for gene in gene_names:
+                data = get_gene_disease_associations(gene)
+                count = len(data) if (data is not None and isinstance(data, list)) else 0
+                disease_counts.append([count])
+            disease_tensor = torch.tensor(disease_counts, dtype=torch.float, device=gene_embedding.device)
+            disease_embedding = self.disease_encoder(disease_tensor)
+            combined = torch.cat([gene_embedding, cross_output, disease_embedding], dim=1)
+        else:
+            combined = torch.cat([gene_embedding, cross_output], dim=1)
+        
         output = self.mlp(combined)
         return output, attn_weights, combined
 
