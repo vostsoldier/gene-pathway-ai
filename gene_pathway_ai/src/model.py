@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,29 +61,46 @@ class PathwayGNN(nn.Module):
         self.conv1 = GATConv(in_channels, hidden_channels, heads=2, edge_dim=edge_dim)
         self.conv2 = GATConv(hidden_channels * 2, out_channels, heads=1, edge_dim=edge_dim)
         
-    def forward(self, data):
+    def forward(self, data, return_node_features=False):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
         x = F.relu(self.conv1(x, edge_index, edge_attr))
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv2(x, edge_index, edge_attr)
+        if return_node_features:
+            return x
         x = global_mean_pool(x, data.batch if hasattr(data, 'batch') else None)
-        
         return x
 
+class CrossModalAttentionLayer(nn.Module):
+    def __init__(self, gene_dim, pathway_dim, attn_dim):
+        super().__init__()
+        self.query_proj = nn.Linear(gene_dim, attn_dim)
+        self.key_proj = nn.Linear(pathway_dim, attn_dim)
+        self.value_proj = nn.Linear(pathway_dim, attn_dim)
+        self.softmax = nn.Softmax(dim=-1)
+    
+    def forward(self, gene_embedding, pathway_node_features):
+        batch_size = gene_embedding.size(0)
+        pathway_nodes = pathway_node_features.unsqueeze(0).expand(batch_size, -1, -1)  
+        Q = self.query_proj(gene_embedding).unsqueeze(1) 
+        K = self.key_proj(pathway_nodes)                
+        V = self.value_proj(pathway_nodes)            
+        scores = torch.matmul(Q, K.transpose(1, 2))     
+        attn_weights = self.softmax(scores)            
+        attn_output = torch.matmul(attn_weights, V)         
+        return attn_output.squeeze(1), attn_weights.squeeze(1) 
 
 class FusionModel(nn.Module):
     def __init__(self, gene_dim: int = 256, pathway_dim: int = 256, 
                  hidden_dims: list = [128, 64], output_dim: int = 1,
                  use_gradient_checkpointing: bool = False, seq_len: int = 512,
-                 embed_dim: Optional[int] = None, hidden_dim: Optional[int] = None,
-                 pathway_data: Optional[Data] = None):
+                 embed_dim: int = None, hidden_dim: int = None,
+                 pathway_data: Optional[object] = None):
         super().__init__()
         if embed_dim is not None:
             gene_dim = embed_dim
-        
         if hidden_dim is not None:
             hidden_dims = [hidden_dim, hidden_dim // 2]
-        
         self.gene_enc = DNABERTEncoder(
             output_dim=gene_dim, 
             use_gradient_checkpointing=use_gradient_checkpointing,
@@ -91,21 +108,20 @@ class FusionModel(nn.Module):
         )
         pathway_in_channels = 4  
         edge_dim = 2
-        
         if pathway_data is not None:
             if hasattr(pathway_data, 'x'):
                 pathway_in_channels = pathway_data.x.size(1)
             if hasattr(pathway_data, 'edge_attr'):
                 edge_dim = pathway_data.edge_attr.size(1)
         print("Using pathway_in_channels =", pathway_in_channels, ", edge_dim =", edge_dim)
-        
         self.pathway_enc = PathwayGNN(
             in_channels=pathway_in_channels, 
             edge_dim=edge_dim, 
             out_channels=pathway_dim
         )
+        self.cross_attn = CrossModalAttentionLayer(gene_dim, pathway_dim, attn_dim=gene_dim)
         layers = []
-        input_dim = gene_dim + pathway_dim
+        input_dim = gene_dim + gene_dim  
         dims = [input_dim] + hidden_dims
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
@@ -114,20 +130,18 @@ class FusionModel(nn.Module):
         layers.append(nn.Linear(dims[-1], output_dim))
         self.mlp = nn.Sequential(*layers)
     
-    def forward(self, gene_seq: torch.Tensor, pathway_data) -> torch.Tensor:
-        gene_embedding = self.gene_enc(gene_seq)
-        pathway_embedding = self.pathway_enc(pathway_data)
-        if gene_embedding.dim() == 3:
-            if gene_embedding.size(1) == 1:
-                gene_embedding = gene_embedding.squeeze(1)
-            else:
-                gene_embedding = gene_embedding.mean(dim=1)
-        if pathway_embedding.dim() == 1:
-            pathway_embedding = pathway_embedding.unsqueeze(0)
-        if pathway_embedding.size(0) == 1 and gene_embedding.size(0) > 1:
-            pathway_embedding = pathway_embedding.expand(gene_embedding.size(0), -1)
-        combined = torch.cat([gene_embedding, pathway_embedding], dim=1)
-        return self.mlp(combined)
+    def forward(self, gene_seq: torch.Tensor, pathway_data) -> Tuple[torch.Tensor, torch.Tensor]:
+        gene_embedding = self.gene_enc(gene_seq)  
+        if gene_embedding.dim() > 2:
+            gene_embedding = gene_embedding.mean(dim=1)
+        pathway_nodes = self.pathway_enc(pathway_data, return_node_features=True)  
+        cross_output, attn_weights = self.cross_attn(gene_embedding, pathway_nodes)
+        if cross_output.dim() > 2:
+            cross_output = cross_output.mean(dim=1)
+            
+        combined = torch.cat([gene_embedding, cross_output], dim=1) 
+        output = self.mlp(combined)
+        return output, attn_weights
 
 
 def tokenize_dna_sequences(sequences: list, max_length: int = 512) -> torch.Tensor:

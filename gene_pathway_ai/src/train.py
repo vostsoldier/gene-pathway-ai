@@ -112,8 +112,8 @@ def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, p
     for i, (genes, labels) in enumerate(train_loader):
         genes, labels = genes.to(device), labels.to(device)
         with autocast():
-            outputs = model(genes, pathway_data)
-            loss = criterion(outputs, labels)
+            predictions, _ = model(genes, pathway_data)  
+            loss = criterion(predictions, labels)
             loss = loss / accumulation_steps
 
         total_loss += loss.item() * genes.size(0)
@@ -133,21 +133,21 @@ def evaluate(model, val_loader, device, pathway_data, criterion):
     model.eval()
     preds, true_labels = [], []
     total_loss = 0.0
-    
+
     with torch.no_grad():
         for genes, labels in val_loader:
             genes = genes.to(device)
             labels = labels.to(device)
             
-            out = model(genes, pathway_data)
-            loss = criterion(out, labels)
+            predictions, _ = model(genes, pathway_data)  
+            loss = criterion(predictions, labels)
             total_loss += loss.item() * genes.size(0)
             
-            predicted = (torch.sigmoid(out) > 0.5).cpu().numpy()
+            predicted = (torch.sigmoid(predictions) > 0.5).cpu().numpy()
             preds.extend(predicted)
             true_labels.extend(labels.cpu().numpy())
-    val_loss = total_loss / len(val_loader.dataset) if len(val_loader.dataset) > 0 else 0
     
+    val_loss = total_loss / len(val_loader.dataset) if len(val_loader.dataset) > 0 else 0
     accuracy = accuracy_score(true_labels, preds)
     precision = precision_score(true_labels, preds, zero_division=0)
     recall = recall_score(true_labels, preds, zero_division=0)
