@@ -130,18 +130,17 @@ class FusionModel(nn.Module):
         layers.append(nn.Linear(dims[-1], output_dim))
         self.mlp = nn.Sequential(*layers)
     
-    def forward(self, gene_seq: torch.Tensor, pathway_data) -> Tuple[torch.Tensor, torch.Tensor]:
-        gene_embedding = self.gene_enc(gene_seq)  
+    def forward(self, gene_seq: torch.Tensor, pathway_data) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gene_embedding = self.gene_enc(gene_seq)  # e.g., [batch, gene_dim]
         if gene_embedding.dim() > 2:
             gene_embedding = gene_embedding.mean(dim=1)
-        pathway_nodes = self.pathway_enc(pathway_data, return_node_features=True)  
+        pathway_nodes = self.pathway_enc(pathway_data, return_node_features=True)  # [num_nodes, pathway_dim]
         cross_output, attn_weights = self.cross_attn(gene_embedding, pathway_nodes)
         if cross_output.dim() > 2:
             cross_output = cross_output.mean(dim=1)
-            
-        combined = torch.cat([gene_embedding, cross_output], dim=1) 
+        combined = torch.cat([gene_embedding, cross_output], dim=1)  # [batch, 2*gene_dim]
         output = self.mlp(combined)
-        return output, attn_weights
+        return output, attn_weights, combined
 
 
 def tokenize_dna_sequences(sequences: list, max_length: int = 512) -> torch.Tensor:

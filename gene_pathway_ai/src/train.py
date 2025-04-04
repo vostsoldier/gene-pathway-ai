@@ -1,6 +1,9 @@
 import argparse
 import csv
 import os
+import sys
+# add the project root (one level up) to sys.path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from typing import Dict, List, Tuple
 import glob
 import torch
@@ -17,6 +20,7 @@ from data_loader import load_gene_sequences, load_pathway_graph, load_genes_from
 from model import FusionModel
 from utils import seq_to_onehot, check_cuda
 from visualize import visualize_latent_space
+from losses import HybridLoss
 
 def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded_pathway_data = None) -> Tuple[DataLoader, DataLoader, torch.Tensor, List[str]]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -106,28 +110,19 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
 def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, accumulation_steps):
     model.train()
     optimizer.zero_grad()
-    step = 0
     total_loss = 0.0
     
     for i, (genes, labels) in enumerate(train_loader):
         genes, labels = genes.to(device), labels.to(device)
         with autocast():
-            predictions, _ = model(genes, pathway_data)  
-            loss = criterion(predictions, labels)
-            loss = loss / accumulation_steps
-
+            predictions, _, latent = model(genes, pathway_data)
+            loss = criterion(predictions, labels, latent)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
         total_loss += loss.item() * genes.size(0)
         
-        scaler.scale(loss).backward()
-
-        if (i + 1) % accumulation_steps == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-        step += 1
-
-    avg_loss = total_loss / len(train_loader.dataset) if len(train_loader.dataset) > 0 else 0
-    return avg_loss
+    return total_loss / len(train_loader.dataset)
 
 def evaluate(model, val_loader, device, pathway_data, criterion):
     model.eval()
@@ -136,11 +131,10 @@ def evaluate(model, val_loader, device, pathway_data, criterion):
 
     with torch.no_grad():
         for genes, labels in val_loader:
-            genes = genes.to(device)
-            labels = labels.to(device)
-            
-            predictions, _ = model(genes, pathway_data)  
-            loss = criterion(predictions, labels)
+            genes, labels = genes.to(device), labels.to(device)
+            # Unpack three outputs: predictions, attention weights, and latent features
+            predictions, _, latent = model(genes, pathway_data)
+            loss = criterion(predictions, labels, latent)
             total_loss += loss.item() * genes.size(0)
             
             predicted = (torch.sigmoid(predictions) > 0.5).cpu().numpy()
@@ -254,8 +248,7 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
     print(f"Model initialized with sequence length {seq_len} and {pathway_feat_dim} pathway features")
     optimizer = optim.AdamW(model.parameters(), lr=2e-5)
     scaler = GradScaler()
-    pos_weight = None
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = HybridLoss()
     
     with open("results/training_log.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
