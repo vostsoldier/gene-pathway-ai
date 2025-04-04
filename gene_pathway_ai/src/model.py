@@ -150,7 +150,7 @@ class FusionModel(nn.Module):
             cross_output = cross_output.mean(dim=1)
         
         if self.use_disease_data and gene_names is not None:
-            from gene_pathway_ai.src.ensembl_api import get_gene_disease_associations
+            from ensembl_api import get_gene_disease_associations
             disease_counts = []
             for gene in gene_names:
                 data = get_gene_disease_associations(gene)
@@ -164,7 +164,6 @@ class FusionModel(nn.Module):
         
         output = self.mlp(combined)
         return output, attn_weights, combined
-
 
 def tokenize_dna_sequences(sequences: list, max_length: int = 512) -> torch.Tensor:
     tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M")
