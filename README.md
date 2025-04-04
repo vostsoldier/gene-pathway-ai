@@ -11,6 +11,17 @@ This project uses a dual-encoder neural network architecture to:
 
 ## Installation
 
+
+
+
+python gene_pathway_ai/src/train.py \
+  --epochs 20 \
+  --accumulation_steps 4 \
+  --pos_dir data/pos_genes \
+  --neg_dir data/neg_genes
+
+
+
 ```bash
 # Clone repository
 git clone https://github.com/vostsoldier/secret.git

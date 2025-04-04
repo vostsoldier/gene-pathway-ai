@@ -114,6 +114,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, p
         with autocast():
             outputs = model(genes, pathway_data)
             loss = criterion(outputs, labels)
+            loss = loss / accumulation_steps
 
         total_loss += loss.item() * genes.size(0)
         
@@ -169,8 +170,18 @@ def gather_latent_space(model, data_loader, device, pathway_data=None):
         for genes, labels in data_loader:
             genes = genes.to(device)
             gene_embed = model.gene_enc(genes)
+            if gene_embed.dim() == 3:
+                if gene_embed.size(1) == 1:
+                    gene_embed = gene_embed.squeeze(1)
+                else:
+                    gene_embed = gene_embed.mean(dim=1)
+                    
             path_embed = model.pathway_enc(pathway_data)
-            path_embed = path_embed.repeat(gene_embed.size(0), 1)
+            if path_embed.dim() == 1:
+                path_embed = path_embed.unsqueeze(0)
+            if path_embed.size(0) == 1 and gene_embed.size(0) > 1:
+                path_embed = path_embed.expand(gene_embed.size(0), -1)
+            
             combined = torch.cat([gene_embed, path_embed], dim=1)
             all_embeddings.append(combined.cpu().numpy())
             all_labels.append(labels.numpy())
@@ -192,8 +203,18 @@ def visualize_all_genes(model, train_loader, val_loader, device, pathway_data, g
         for genes, labels in full_loader:
             genes = genes.to(device)
             gene_embed = model.gene_enc(genes)
+            if gene_embed.dim() == 3:
+                if gene_embed.size(1) == 1:
+                    gene_embed = gene_embed.squeeze(1)
+                else:
+                    gene_embed = gene_embed.mean(dim=1)
+                    
             path_embed = model.pathway_enc(pathway_data)
-            path_embed = path_embed.repeat(gene_embed.size(0), 1)
+            if path_embed.dim() == 1:
+                path_embed = path_embed.unsqueeze(0)
+            if path_embed.size(0) == 1 and gene_embed.size(0) > 1:
+                path_embed = path_embed.expand(gene_embed.size(0), -1)
+                
             combined = torch.cat([gene_embed, path_embed], dim=1)
             embeddings = combined.cpu().numpy()
             label_values = labels.cpu().numpy()
@@ -225,13 +246,13 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
     pathway_feat_dim = pathway_data.x.shape[1]  
     model = FusionModel(
         seq_len=seq_len, 
-        pathway_feat_dim=pathway_feat_dim,
+        pathway_dim=pathway_feat_dim,
         embed_dim=64,
         hidden_dim=64
     ).to(device)
     
     print(f"Model initialized with sequence length {seq_len} and {pathway_feat_dim} pathway features")
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
     scaler = GradScaler()
     pos_weight = None
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -288,7 +309,12 @@ def create_final_visualization(args):
         pathway_data
     )
     pathway_data = pathway_data.to(device)
-    best_model = FusionModel(seq_len=10000).to(device)
+    best_model = FusionModel(
+        seq_len=10000,
+        embed_dim=64,    
+        hidden_dim=64, 
+        pathway_dim=4  
+    ).to(device)
     best_model.load_state_dict(torch.load("results/best_model.pt"))
     print("Creating final visualization with best model...")
     visualize_all_genes(

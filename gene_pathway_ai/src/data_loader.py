@@ -292,6 +292,15 @@ def augment_sequence(seq: str, mutation_rate: float = 0.1) -> str:
     
     return mutated_seq
 
+def prepare_dna_sequence(sequence_data, tokenizer, max_length=10000):
+    encoding = tokenizer(
+        sequence_data,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=max_length,
+        truncation=True
+    )
+    return encoding.input_ids
 
 def test_augmentation():
     sample_seq = "ATGCATGCATGCATGCATGC" * 5 
