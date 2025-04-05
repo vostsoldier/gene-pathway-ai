@@ -18,7 +18,7 @@ import seaborn as sns
 from data_loader import load_gene_sequences, load_pathway_graph, load_genes_from_dir
 from model import FusionModel
 from utils import seq_to_onehot, check_cuda
-from visualize import visualize_latent_space, visualize_attention, visualize_attention_for_all_genes
+from visualize import visualize_latent_space, visualize_attention, visualize_attention_for_all_genes, visualize_attention_for_original_genes
 from losses import HybridLoss
 
 def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded_pathway_data = None) -> Tuple[DataLoader, DataLoader, torch.Tensor, List[str], torch.Tensor]:
@@ -349,17 +349,16 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
             
             if pathway_node_names is not None and gene_names is not None:
                 print("Generating visualizations for best model...")
-                visualize_all_gene_attention(
+                full_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
+                visualize_attention_for_original_genes(
                     model,
-                    train_loader,
-                    val_loader,
+                    full_dataset,
                     device, 
                     pathway_data,
                     pathway_node_names,
                     gene_names,
                     epoch,
-                    save_dir="results",
-                    suffix="_best"
+                    save_dir="results"
                 )
         else:
             patience_counter += 1

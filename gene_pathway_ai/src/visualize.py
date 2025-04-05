@@ -163,7 +163,6 @@ def attention_heatmap(attn_weights, gene_names, node_names, filename="heatmap.pn
     plt.savefig(filename)
     plt.close()
 
-# Add this function:
 def visualize_attention_for_all_genes(model, dataset, device, pathway_data, pathway_node_names, gene_names, epoch, save_dir="results"):
     model.eval()
     full_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
@@ -185,4 +184,63 @@ def visualize_attention_for_all_genes(model, dataset, device, pathway_data, path
                 epoch,
                 save_dir=save_dir
             )
-            break  
+            break
+
+def visualize_attention_for_original_genes(model, dataset, device, pathway_data, pathway_node_names, gene_names, epoch, save_dir="results"):
+    model.eval()
+    original_genes = []
+    original_indices = []
+    
+    for i, name in enumerate(gene_names):
+        if "_aug" not in name:
+            original_genes.append(name)
+            original_indices.append(i)
+    
+    print(f"Found {len(original_genes)} original genes (without augmentations)")
+    selected_data = []
+    for idx in original_indices:
+        if idx < len(dataset):
+            selected_data.append(dataset[idx])
+    if not selected_data:
+        print("Processing full dataset and filtering results...")
+        full_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+        
+        with torch.no_grad():
+            for genes, disease_counts, labels in full_loader:
+                genes = genes.to(device)
+                disease_counts = disease_counts.to(device)
+                _, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
+                original_attn = []
+                for i in original_indices:
+                    if i < len(genes):
+                        original_attn.append(attn_weights[i].unsqueeze(0))
+                
+                if original_attn:
+                    original_attn = torch.cat(original_attn, dim=0)
+                    print(f"Creating attention visualization for {len(original_genes)} original genes")
+                    visualize_attention(
+                        original_attn,
+                        original_genes,  
+                        pathway_node_names,
+                        epoch,
+                        save_dir=save_dir,
+                        suffix="_original_only"
+                    )
+                break
+    else:
+        genes_batch, disease_counts_batch, labels_batch = zip(*selected_data)
+        genes_tensor = torch.stack(genes_batch).to(device)
+        disease_counts_tensor = torch.stack(disease_counts_batch).to(device)
+        
+        with torch.no_grad():
+            _, attn_weights, _ = model(genes_tensor, pathway_data, disease_counts=disease_counts_tensor)
+            
+            print(f"Creating attention visualization for {len(original_genes)} original genes")
+            visualize_attention(
+                attn_weights,
+                original_genes,  
+                pathway_node_names,
+                epoch,
+                save_dir=save_dir,
+                suffix="_original_only"
+            )
