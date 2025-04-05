@@ -42,8 +42,8 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
     print(f"Original count: ~{len(pos_genes)//10} positive, ~{len(neg_genes)//10} negative")
     pos_ratio = len(pos_genes) / (len(pos_genes) + len(neg_genes))
     print(f"Class distribution: {pos_ratio:.2f} positive, {1-pos_ratio:.2f} negative")
-    
-    if abs(pos_ratio - 0.5) > 0.1:
+
+    if abs(pos_ratio - 0.5) > 0.1:  
         print("Warning: Class imbalance detected (>10% difference)")
         print("Using weighted sampling to balance classes")
         use_class_weighting = True
@@ -51,54 +51,71 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
         print("Classes are reasonably balanced")
         use_class_weighting = False
     
-    gene_tensors = []
-    gene_names = []
-    labels = []
-    disease_counts = []
-    gene_disease_data = [] 
+    all_original_genes = set()
+    for gene_name, _ in pos_genes + neg_genes:
+        base_name = gene_name.split('_aug')[0]
+        all_original_genes.add(base_name)
     
-    print("Fetching disease associations from ENSEMBL...")
-    for gene_name, seq in tqdm(pos_genes + neg_genes, desc="Querying ENSEMBL API"):
-        assert ">" not in seq, f"Header character '>' found in sequence from {gene_name}"
-        assert len(seq) == 10000, f"Sequence length mismatch for {gene_name}: {len(seq)} != 10000"
-        
-        gene_tensors.append(seq_to_onehot(seq))
-        gene_names.append(gene_name)
-        
+    print(f"Fetching disease associations from ENSEMBL for {len(all_original_genes)} original genes...")
+    gene_disease_map = {}
+    for gene_name in tqdm(all_original_genes, desc="Querying ENSEMBL API"):
         associations = get_gene_disease_associations(gene_name)
-        diseases = []
-        
         if associations is not None and isinstance(associations, list):
             count = len(associations)
+            diseases = []
             for assoc in associations:
                 if isinstance(assoc, dict) and 'description' in assoc:
                     disease_name = assoc['description']
                     diseases.append(disease_name)
         else:
             count = 0
-            diseases = ["Unknown"] 
+            diseases = ["Unknown"]
             
-        disease_counts.append([count])
-
+        gene_disease_map[gene_name] = {
+            'count': count,
+            'diseases': diseases
+        }
+    
+    gene_tensors = []
+    gene_names = []
+    labels = []
+    disease_counts = []
+    gene_disease_data = []
+    
+    for gene_name, seq in pos_genes + neg_genes:
+        base_name = gene_name.split('_aug')[0]  
+        assert ">" not in seq, f"Header character '>' found in sequence from {gene_name}"
+        assert len(seq) == 10000, f"Sequence length mismatch for {gene_name}: {len(seq)} != 10000"
+        
+        gene_tensors.append(seq_to_onehot(seq))
+        gene_names.append(gene_name)
+        
+        disease_data = gene_disease_map[base_name]
+        disease_counts.append([disease_data['count']])
+        
         gene_disease_data.append({
             'gene': gene_name,
-            'diseases': ';'.join(diseases) if diseases else "None"
+            'original_gene': base_name,
+            'diseases': ';'.join(disease_data['diseases']) if disease_data['diseases'] else "None"
         })
+    
     for _ in pos_genes:
         labels.append(1)
     for _ in neg_genes:
         labels.append(0)
-
+        
     import pandas as pd
     os.makedirs('data', exist_ok=True)
     gene_disease_df = pd.DataFrame(gene_disease_data)
     gene_disease_df.to_csv('data/gene_disease_associations.csv', index=False)
     print(f"Exported gene-disease associations to data/gene_disease_associations.csv")
+    
     genes_batch = torch.stack(gene_tensors)
     labels_tensor = torch.tensor(labels, dtype=torch.float).view(-1, 1)
     disease_counts_tensor = torch.tensor(disease_counts, dtype=torch.float)
     
     dataset = TensorDataset(genes_batch, disease_counts_tensor, labels_tensor)
+    
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     
