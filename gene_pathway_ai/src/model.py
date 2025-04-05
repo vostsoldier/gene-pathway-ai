@@ -58,14 +58,44 @@ class DNABERTEncoder(nn.Module):
 class PathwayGNN(nn.Module):
     def __init__(self, in_channels=4, hidden_channels=16, out_channels=256, edge_dim=2):
         super().__init__()
-        self.conv1 = GATConv(in_channels, hidden_channels, heads=2, edge_dim=edge_dim)
+        self.hidden_channels = hidden_channels
+        self.edge_types = ['activation', 'inhibition', 'undefined']
+        self.conv1_dict = nn.ModuleDict({
+            'activation': GATConv(in_channels, hidden_channels, heads=2, edge_dim=edge_dim-1),
+            'inhibition': GATConv(in_channels, hidden_channels, heads=2, edge_dim=edge_dim-1),
+            'undefined': GATConv(in_channels, hidden_channels, heads=2, edge_dim=edge_dim-1)
+        })
+        
         self.conv2 = GATConv(hidden_channels * 2, out_channels, heads=1, edge_dim=edge_dim)
         
     def forward(self, data, return_node_features=False):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        x = F.relu(self.conv1(x, edge_index, edge_attr))
+        edge_type_outputs = []
+        activation_mask = (edge_attr[:,0] > 0.5) 
+        inhibition_mask = (edge_attr[:,0] < -0.5) 
+        undefined_mask = (~activation_mask & ~inhibition_mask)  
+        
+        type_masks = {
+            'activation': activation_mask,
+            'inhibition': inhibition_mask,
+            'undefined': undefined_mask
+        }
+        x_agg = None
+        for edge_type, mask in type_masks.items():
+            if torch.any(mask):  
+                edge_index_type = edge_index[:, mask]
+                edge_attr_type = edge_attr[mask, 1:] if edge_attr.size(1) > 1 else None
+                x_type = self.conv1_dict[edge_type](x, edge_index_type, edge_attr_type)
+                if x_agg is None:
+                    x_agg = x_type
+                else:
+                    x_agg = x_agg + x_type
+        if x_agg is None:
+            x_agg = torch.zeros(x.size(0), self.hidden_channels * 2, device=x.device)
+        x = F.relu(x_agg)
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv2(x, edge_index, edge_attr)
+        
         if return_node_features:
             return x
         x = global_mean_pool(x, data.batch if hasattr(data, 'batch') else None)

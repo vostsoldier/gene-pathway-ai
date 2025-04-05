@@ -21,7 +21,7 @@ def load_gene_sequence(file_path: str) -> str:
     seq = "".join([l.strip() for l in lines if not l.startswith(">")])
     return seq
 
-def load_genes_from_dir(dir_path: str, max_length: int = 10000, augment: bool = True) -> List[Tuple[str, str]]:
+def load_genes_from_dir(dir_path: str, max_length: int = 10000, augment: bool = True, num_augmentations: int = 10) -> List[Tuple[str, str]]:
     if not os.path.exists(dir_path):
         raise FileNotFoundError(f"Directory not found: {dir_path}")
     
@@ -32,10 +32,29 @@ def load_genes_from_dir(dir_path: str, max_length: int = 10000, augment: bool = 
     for file_name in tqdm(gene_files, desc="Loading genes"):
         file_path = os.path.join(dir_path, file_name)
         gene_name = os.path.splitext(file_name)[0].upper()
-        seq = load_gene_sequences(file_path, max_length=max_length, augment=augment)
+        original_seq = load_gene_sequence(file_path)
+        original_seq = original_seq.upper().replace('U', 'T')
+        assert ">" not in original_seq, f"Header character '>' found in sequence from {file_path}"
+        if len(original_seq) > max_length:
+            original_seq = original_seq[:max_length]
+        else:
+            original_seq += "N" * (max_length - len(original_seq))
+      
+        result.append((gene_name, original_seq))
         
-        result.append((gene_name, seq))
+        if augment:
+            for i in range(1, num_augmentations):
+                mutation_rate = 0.001 * (0.8 + 0.4 * (i / num_augmentations))
+                deletion_rate = 0.0005 * (0.8 + 0.4 * (i / num_augmentations))
+                augmented_seq = apply_augmentations(
+                    original_seq, 
+                    mutation_rate=mutation_rate,
+                    deletion_rate=deletion_rate
+                )
+                aug_name = f"{gene_name}_aug{i}"
+                result.append((aug_name, augmented_seq))
     
+    print(f"Generated dataset with {len(result)} sequences ({len(gene_files)} original + {len(result) - len(gene_files)} augmented)")
     return result
 
 def load_gene_sequences(file_path: str, max_length: int = 10000, augment: bool = True) -> str:
@@ -56,15 +75,21 @@ def load_gene_sequences(file_path: str, max_length: int = 10000, augment: bool =
 def apply_augmentations(seq: str, mutation_rate: float, deletion_rate: float) -> str:
     nucleotides = ['A', 'C', 'G', 'T']
     seq_list = list(seq)
+    original_length = len(seq_list)
     new_seq = []
+    deleted_count = 0
     
     for base in seq_list:
         if random.random() < deletion_rate:
+            deleted_count += 1
             continue
+            
         if random.random() < mutation_rate:
             base = random.choice(nucleotides)
             
         new_seq.append(base)
+    while len(new_seq) < original_length:
+        new_seq.append(random.choice(nucleotides))
     
     return "".join(new_seq)
 

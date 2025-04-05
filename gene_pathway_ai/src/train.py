@@ -2,7 +2,6 @@ import argparse
 import csv
 import os
 import sys
-# add the project root (one level up) to sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from typing import Dict, List, Tuple
 import glob
@@ -32,26 +31,18 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
         pathway_data = load_pathway_graph(pathway_file)
     else:
         raise ValueError("Either pathway_file or preloaded_pathway_data must be provided")
-    pos_files = glob.glob(os.path.join(pos_dir, "*.txt")) + glob.glob(os.path.join(pos_dir, "*.fasta"))
-    neg_files = glob.glob(os.path.join(neg_dir, "*.txt")) + glob.glob(os.path.join(neg_dir, "*.fasta"))
     
-    print(f"Found {len(pos_files)} positive gene files and {len(neg_files)} negative gene files")
-    pos_genes = []
-    print("Loading positive genes...")
-    for file_path in tqdm(pos_files, desc="Loading DNA repair genes"):
-        gene_name = os.path.splitext(os.path.basename(file_path))[0].upper()
-        seq = load_gene_sequences(file_path, max_length=10000, augment=True)
-        pos_genes.append((gene_name, seq))
-    neg_genes = []
-    print("Loading negative genes...")
-    for file_path in tqdm(neg_files, desc="Loading housekeeping genes"):
-        gene_name = os.path.splitext(os.path.basename(file_path))[0].upper()
-        seq = load_gene_sequences(file_path, max_length=10000, augment=True)
-        neg_genes.append((gene_name, seq))
+    print(f"Loading positive genes with augmentation...")
+    pos_genes = load_genes_from_dir(pos_dir, max_length=10000, augment=True, num_augmentations=10)
+    
+    print(f"Loading negative genes with augmentation...")
+    neg_genes = load_genes_from_dir(neg_dir, max_length=10000, augment=True, num_augmentations=10)
     
     print(f"Loaded {len(pos_genes)} positive genes and {len(neg_genes)} negative genes")
+    print(f"Original count: ~{len(pos_genes)//10} positive, ~{len(neg_genes)//10} negative")
     pos_ratio = len(pos_genes) / (len(pos_genes) + len(neg_genes))
     print(f"Class distribution: {pos_ratio:.2f} positive, {1-pos_ratio:.2f} negative")
+    
     if abs(pos_ratio - 0.5) > 0.1:
         print("Warning: Class imbalance detected (>10% difference)")
         print("Using weighted sampling to balance classes")
@@ -59,10 +50,12 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
     else:
         print("Classes are reasonably balanced")
         use_class_weighting = False
+    
     gene_tensors = []
     gene_names = []
     labels = []
-    disease_counts = [] 
+    disease_counts = []
+    gene_disease_data = [] 
     
     print("Fetching disease associations from ENSEMBL...")
     for gene_name, seq in tqdm(pos_genes + neg_genes, desc="Querying ENSEMBL API"):
@@ -71,21 +64,40 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
         
         gene_tensors.append(seq_to_onehot(seq))
         gene_names.append(gene_name)
+        
         associations = get_gene_disease_associations(gene_name)
+        diseases = []
+        
         if associations is not None and isinstance(associations, list):
             count = len(associations)
+            for assoc in associations:
+                if isinstance(assoc, dict) and 'description' in assoc:
+                    disease_name = assoc['description']
+                    diseases.append(disease_name)
         else:
-            count = 0  
+            count = 0
+            diseases = ["Unknown"] 
             
         disease_counts.append([count])
+
+        gene_disease_data.append({
+            'gene': gene_name,
+            'diseases': ';'.join(diseases) if diseases else "None"
+        })
     for _ in pos_genes:
         labels.append(1)
     for _ in neg_genes:
         labels.append(0)
-        
+
+    import pandas as pd
+    os.makedirs('data', exist_ok=True)
+    gene_disease_df = pd.DataFrame(gene_disease_data)
+    gene_disease_df.to_csv('data/gene_disease_associations.csv', index=False)
+    print(f"Exported gene-disease associations to data/gene_disease_associations.csv")
     genes_batch = torch.stack(gene_tensors)
     labels_tensor = torch.tensor(labels, dtype=torch.float).view(-1, 1)
     disease_counts_tensor = torch.tensor(disease_counts, dtype=torch.float)
+    
     dataset = TensorDataset(genes_batch, disease_counts_tensor, labels_tensor)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -95,7 +107,6 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
         [train_size, val_size],
         generator=torch.Generator().manual_seed(42) 
     )
-
     if use_class_weighting:
         train_indices = train_dataset.indices
         train_labels = [labels[idx] for idx in train_indices]
