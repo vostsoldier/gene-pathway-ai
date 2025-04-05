@@ -73,6 +73,9 @@ def load_gene_sequences(file_path: str, max_length: int = 10000, augment: bool =
     return seq
 
 def apply_augmentations(seq: str, mutation_rate: float, deletion_rate: float) -> str:
+    mutation_rate = mutation_rate * 10 
+    deletion_rate = deletion_rate * 10 
+    
     nucleotides = ['A', 'C', 'G', 'T']
     seq_list = list(seq)
     original_length = len(seq_list)

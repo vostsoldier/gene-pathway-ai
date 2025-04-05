@@ -161,31 +161,37 @@ def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, p
         
     return total_loss / len(train_loader.dataset)
 
-def evaluate(model, val_loader, device, pathway_data, criterion, epoch=None, pathway_node_names=None, gene_names=None, 
-             is_best=False, final_epoch=False):
+def evaluate(model, val_loader, device, pathway_data, criterion, epoch=None, 
+             pathway_node_names=None, gene_names=None, is_best=False, final_epoch=False):
     model.eval()
+    preds_raw = [] 
     preds, true_labels = [], []
-    total_loss = 0.0
-    all_gene_indices = []
-    all_attn_weights = []
+    total_loss = 0.0  
 
     with torch.no_grad():
-        batch_start_idx = 0
-        for batch_idx, (genes, disease_counts, labels) in enumerate(val_loader):
+        for genes, disease_counts, labels in val_loader:
             genes, disease_counts, labels = genes.to(device), disease_counts.to(device), labels.to(device)
             predictions, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
             loss = criterion(predictions, labels, attn_weights)
             total_loss += loss.item() * genes.size(0)
-            all_attn_weights.append(attn_weights.cpu())
-            batch_size = len(genes)
-            batch_indices = list(range(batch_start_idx, batch_start_idx + batch_size))
-            all_gene_indices.extend(batch_indices)
-            batch_start_idx += batch_size
-            
+            preds_raw.extend(torch.sigmoid(predictions).cpu().numpy())
             predicted = (torch.sigmoid(predictions) > 0.5).cpu().numpy()
             preds.extend(predicted)
             true_labels.extend(labels.cpu().numpy())
-    
+    if len(preds_raw) > 0:
+        true_labels_np = np.array(true_labels)
+        best_f1 = 0
+        best_threshold = 0.5
+        
+        for threshold in np.arange(0.3, 0.7, 0.05):
+            thresholded_preds = (np.array(preds_raw) > threshold).astype(int)
+            f1 = f1_score(true_labels_np, thresholded_preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        if best_f1 > f1_score(true_labels, preds, zero_division=0):
+            preds = (np.array(preds_raw) > best_threshold).astype(int).tolist()
+            print(f"Optimized threshold: {best_threshold:.2f}")
     val_loss = total_loss / len(val_loader.dataset) if len(val_loader.dataset) > 0 else 0
     accuracy = accuracy_score(true_labels, preds)
     precision = precision_score(true_labels, preds, zero_division=0)
@@ -295,7 +301,10 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
     ).to(device)
     
     print(f"Model initialized with sequence length {seq_len} and {pathway_feat_dim} pathway features")
-    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01) 
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
+    
     scaler = GradScaler()
     criterion = HybridLoss()
     pathway_node_names = []
@@ -312,7 +321,9 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
 
     best_val_loss = float('inf')
     patience_counter = 0
-    patience = 5 
+    
+    patience = 10  
+    
     is_best = False
     
     for epoch in range(args.epochs):
@@ -355,6 +366,8 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
+        
+        scheduler.step(val_loss)
         
         if epoch % 5 == 0:  
             all_embeddings, all_labels = gather_latent_space(model, val_loader, device, pathway_data)

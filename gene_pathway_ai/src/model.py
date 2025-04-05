@@ -122,11 +122,11 @@ class CrossModalAttentionLayer(nn.Module):
 
 class FusionModel(nn.Module):
     def __init__(self, gene_dim: int = 256, pathway_dim: int = 256, 
-                 hidden_dims: list = [128, 64], output_dim: int = 1,
+                 hidden_dims: list = [256, 128], output_dim: int = 1,  
                  use_gradient_checkpointing: bool = False, seq_len: int = 512,
                  embed_dim: Optional[int] = None, hidden_dim: Optional[int] = None,
-                 pathway_data: Optional[object] = None, use_disease_data: bool = False,
-                 disease_emb_dim: int = 16):
+                 pathway_data: Optional[object] = None, use_disease_data: bool = True,  
+                 disease_emb_dim: int = 32):  
         super().__init__()
         if embed_dim is not None:
             gene_dim = embed_dim
@@ -156,6 +156,9 @@ class FusionModel(nn.Module):
         if self.use_disease_data:
             self.disease_encoder = nn.Sequential(
                 nn.Linear(1, disease_emb_dim),
+                nn.LayerNorm(disease_emb_dim), 
+                nn.ReLU(),
+                nn.Linear(disease_emb_dim, disease_emb_dim),  
                 nn.ReLU()
             )
             mlp_input_dim = gene_dim + gene_dim + disease_emb_dim
