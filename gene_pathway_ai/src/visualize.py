@@ -1,6 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 import os
+import torch
+from torch.utils.data import DataLoader 
+from typing import List, Optional
 try:
     from umap import UMAP  
 except ImportError:
@@ -41,3 +45,144 @@ def visualize_latent_space(embeddings: np.ndarray, labels: np.ndarray, gene_name
     os.makedirs("results", exist_ok=True)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     plt.close()
+
+def visualize_attention(attn_weights, gene_names: List[str], pathway_node_names: List[str], 
+                        epoch: int, save_dir: str = "results", suffix: str = ""):
+    os.makedirs(save_dir, exist_ok=True)
+    
+    if isinstance(attn_weights, torch.Tensor):
+        attn_weights = attn_weights.cpu().numpy()
+    if len(attn_weights.shape) > 2:
+        attn_weights = attn_weights.mean(axis=1)
+    
+    if len(gene_names) > attn_weights.shape[0]:
+        print(f"Warning: {len(gene_names)} gene names provided but only {attn_weights.shape[0]} attention weight vectors available")
+        gene_names = gene_names[:attn_weights.shape[0]]  
+    max_genes = min(len(gene_names), 20, attn_weights.shape[0])
+    cosine_similarities = np.zeros((max_genes, max_genes))
+    for i in range(max_genes):
+        for j in range(max_genes):
+            if i == j:
+                cosine_similarities[i,j] = 1.0
+                continue
+            sim = np.dot(attn_weights[i], attn_weights[j]) / (
+                np.linalg.norm(attn_weights[i]) * np.linalg.norm(attn_weights[j]) + 1e-8)
+            cosine_similarities[i,j] = sim
+    
+    avg_similarity = (cosine_similarities.sum() - max_genes) / (max_genes * (max_genes - 1))
+    print(f"Average similarity between gene attention patterns: {avg_similarity:.4f}")
+    if avg_similarity > 0.9:
+        print("WARNING: Gene attention patterns are nearly identical! Model may need more training.")
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cosine_similarities, xticklabels=gene_names[:max_genes], 
+                yticklabels=gene_names[:max_genes], cmap='coolwarm')
+    plt.title(f"Gene Attention Pattern Similarity (Epoch {epoch})\nAvg: {avg_similarity:.4f}")
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/attention_similarity{suffix}.png", dpi=300)
+    plt.close()
+    normalized_weights = attn_weights.copy()
+    for i in range(attn_weights.shape[0]):
+        row_min = normalized_weights[i].min()
+        row_max = normalized_weights[i].max()
+        if row_max > row_min:  
+            normalized_weights[i] = (normalized_weights[i] - row_min) / (row_max - row_min)
+
+    max_nodes = min(len(pathway_node_names), 30)
+    display_genes = gene_names[:max_genes]
+    display_nodes = pathway_node_names[:max_nodes]
+    display_weights = normalized_weights[:max_genes, :max_nodes]
+    plt.figure(figsize=(14, 10)) 
+    ax = sns.heatmap(
+        display_weights,
+        xticklabels=display_nodes,
+        yticklabels=display_genes,
+        cmap='viridis',
+        annot=False,
+        linewidths=0.5
+    )
+    plt.title(f"Gene-Pathway Attention Weights (Epoch {epoch})")
+    plt.xlabel("Pathway Nodes")
+    plt.ylabel("Genes")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/attention_heatmap{suffix}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    grid_cols = min(5, max_genes)
+    grid_rows = (max_genes + grid_cols - 1) // grid_cols  
+    
+    plt.figure(figsize=(16, 3*grid_rows))
+    for i, gene in enumerate(display_genes):
+        gene_weights = attn_weights[i]
+        top_indices = np.argsort(gene_weights)[-5:][::-1]
+        top_nodes = [pathway_node_names[idx] for idx in top_indices]
+        top_weights = [gene_weights[idx] for idx in top_indices]
+        plt.subplot(grid_rows, grid_cols, i+1)
+        plt.barh(top_nodes, top_weights, color=plt.cm.viridis(np.linspace(0.2, 0.8, 5)))
+        plt.title(f"{gene}", fontsize=10)
+        plt.xticks(fontsize=8)
+        plt.yticks(fontsize=8)
+    
+    plt.suptitle(f"Top 5 Pathway Nodes by Gene (Epoch {epoch})", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) 
+    plt.savefig(f"{save_dir}/attention_top5{suffix}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    if max_genes > 10:
+        for split_idx, split_range in enumerate([range(0, 10), range(10, max_genes)]):
+            plt.figure(figsize=(16, 15))
+            for i, idx in enumerate(split_range):
+                if idx >= max_genes:
+                    break
+                gene = display_genes[idx]
+                gene_weights = attn_weights[idx]
+                top_indices = np.argsort(gene_weights)[-5:][::-1]
+                top_nodes = [pathway_node_names[j] for j in top_indices]
+                top_weights = [gene_weights[j] for j in top_indices]
+                
+                plt.subplot(5, 2, i+1)
+                plt.barh(top_nodes, top_weights, color=plt.cm.viridis(np.linspace(0.2, 0.8, 5)))
+                plt.title(f"{gene}", fontsize=11)
+                plt.xticks(fontsize=9)
+                plt.yticks(fontsize=9)
+            
+            plt.suptitle(f"Top 5 Pathway Nodes by Gene - Set {split_idx+1} (Epoch {epoch})", fontsize=16)
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.savefig(f"{save_dir}/attention_top5_set{split_idx+1}{suffix}.png", dpi=300, bbox_inches='tight')
+            plt.close()
+def attention_heatmap(attn_weights, gene_names, node_names, filename="heatmap.png"):
+    if isinstance(attn_weights, torch.Tensor):
+        attn_weights = attn_weights.cpu().numpy()
+        
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(
+        attn_weights,
+        xticklabels=node_names[:attn_weights.shape[1]],
+        yticklabels=gene_names[:attn_weights.shape[0]],
+        cmap='viridis'
+    )
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
+# Add this function:
+def visualize_attention_for_all_genes(model, dataset, device, pathway_data, pathway_node_names, gene_names, epoch, save_dir="results"):
+    model.eval()
+    full_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+    
+    with torch.no_grad():
+        for genes, disease_counts, labels in full_loader:
+            genes = genes.to(device)
+            disease_counts = disease_counts.to(device)
+            _, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
+            
+            print(f"Creating attention visualization for all {len(genes)} genes")
+            print(f"Gene names: {', '.join(gene_names)}")
+            print(f"Attention weights shape: {attn_weights.shape}")
+            print(f"Number of genes in batch: {len(genes)} / Number of gene names: {len(gene_names)}")
+            visualize_attention(
+                attn_weights,
+                gene_names,  
+                pathway_node_names,
+                epoch,
+                save_dir=save_dir
+            )
+            break  

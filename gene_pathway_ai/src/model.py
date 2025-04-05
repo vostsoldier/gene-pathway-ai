@@ -140,7 +140,7 @@ class FusionModel(nn.Module):
         layers.append(nn.Linear(dims[-1], output_dim))
         self.mlp = nn.Sequential(*layers)
         
-    def forward(self, gene_seq: torch.Tensor, pathway_data, gene_names: Optional[List[str]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, gene_seq: torch.Tensor, pathway_data, disease_counts: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         gene_embedding = self.gene_enc(gene_seq)
         if gene_embedding.dim() > 2:
             gene_embedding = gene_embedding.mean(dim=1)
@@ -149,15 +149,8 @@ class FusionModel(nn.Module):
         if cross_output.dim() > 2:
             cross_output = cross_output.mean(dim=1)
         
-        if self.use_disease_data and gene_names is not None:
-            from ensembl_api import get_gene_disease_associations
-            disease_counts = []
-            for gene in gene_names:
-                data = get_gene_disease_associations(gene)
-                count = len(data) if (data is not None and isinstance(data, list)) else 0
-                disease_counts.append([count])
-            disease_tensor = torch.tensor(disease_counts, dtype=torch.float, device=gene_embedding.device)
-            disease_embedding = self.disease_encoder(disease_tensor)
+        if self.use_disease_data and disease_counts is not None:
+            disease_embedding = self.disease_encoder(disease_counts)
             combined = torch.cat([gene_embedding, cross_output, disease_embedding], dim=1)
         else:
             combined = torch.cat([gene_embedding, cross_output], dim=1)

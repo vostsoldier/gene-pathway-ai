@@ -19,11 +19,13 @@ import seaborn as sns
 from data_loader import load_gene_sequences, load_pathway_graph, load_genes_from_dir
 from model import FusionModel
 from utils import seq_to_onehot, check_cuda
-from visualize import visualize_latent_space
+from visualize import visualize_latent_space, visualize_attention, visualize_attention_for_all_genes
 from losses import HybridLoss
 
-def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded_pathway_data = None) -> Tuple[DataLoader, DataLoader, torch.Tensor, List[str]]:
+def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded_pathway_data = None) -> Tuple[DataLoader, DataLoader, torch.Tensor, List[str], torch.Tensor]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from ensembl_api import get_gene_disease_associations
+    
     if preloaded_pathway_data is not None:
         pathway_data = preloaded_pathway_data
     elif pathway_file is not None:
@@ -60,24 +62,31 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
     gene_tensors = []
     gene_names = []
     labels = []
+    disease_counts = [] 
     
-    for gene_name, seq in pos_genes:
+    print("Fetching disease associations from ENSEMBL...")
+    for gene_name, seq in tqdm(pos_genes + neg_genes, desc="Querying ENSEMBL API"):
         assert ">" not in seq, f"Header character '>' found in sequence from {gene_name}"
         assert len(seq) == 10000, f"Sequence length mismatch for {gene_name}: {len(seq)} != 10000"
         
         gene_tensors.append(seq_to_onehot(seq))
         gene_names.append(gene_name)
-        labels.append(1)  
-    for gene_name, seq in neg_genes:
-        assert ">" not in seq, f"Header character '>' found in sequence from {gene_name}"
-        assert len(seq) == 10000, f"Sequence length mismatch for {gene_name}: {len(seq)} != 10000"
+        associations = get_gene_disease_associations(gene_name)
+        if associations is not None and isinstance(associations, list):
+            count = len(associations)
+        else:
+            count = 0  
+            
+        disease_counts.append([count])
+    for _ in pos_genes:
+        labels.append(1)
+    for _ in neg_genes:
+        labels.append(0)
         
-        gene_tensors.append(seq_to_onehot(seq))
-        gene_names.append(gene_name)
-        labels.append(0)  
     genes_batch = torch.stack(gene_tensors)
     labels_tensor = torch.tensor(labels, dtype=torch.float).view(-1, 1)
-    dataset = TensorDataset(genes_batch, labels_tensor)
+    disease_counts_tensor = torch.tensor(disease_counts, dtype=torch.float)
+    dataset = TensorDataset(genes_batch, disease_counts_tensor, labels_tensor)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     
@@ -112,11 +121,11 @@ def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, p
     optimizer.zero_grad()
     total_loss = 0.0
     
-    for i, (genes, labels) in enumerate(train_loader):
-        genes, labels = genes.to(device), labels.to(device)
+    for i, (genes, disease_counts, labels) in enumerate(train_loader):
+        genes, disease_counts, labels = genes.to(device), disease_counts.to(device), labels.to(device)
         with autocast():
-            predictions, _, latent = model(genes, pathway_data)
-            loss = criterion(predictions, labels, latent)
+            predictions, attn_weights, latent = model(genes, pathway_data, disease_counts=disease_counts)
+            loss = criterion(predictions, labels, attn_weights)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -124,18 +133,26 @@ def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, p
         
     return total_loss / len(train_loader.dataset)
 
-def evaluate(model, val_loader, device, pathway_data, criterion):
+def evaluate(model, val_loader, device, pathway_data, criterion, epoch=None, pathway_node_names=None, gene_names=None, 
+             is_best=False, final_epoch=False):
     model.eval()
     preds, true_labels = [], []
     total_loss = 0.0
+    all_gene_indices = []
+    all_attn_weights = []
 
     with torch.no_grad():
-        for genes, labels in val_loader:
-            genes, labels = genes.to(device), labels.to(device)
-            # Unpack three outputs: predictions, attention weights, and latent features
-            predictions, _, latent = model(genes, pathway_data)
-            loss = criterion(predictions, labels, latent)
+        batch_start_idx = 0
+        for batch_idx, (genes, disease_counts, labels) in enumerate(val_loader):
+            genes, disease_counts, labels = genes.to(device), disease_counts.to(device), labels.to(device)
+            predictions, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
+            loss = criterion(predictions, labels, attn_weights)
             total_loss += loss.item() * genes.size(0)
+            all_attn_weights.append(attn_weights.cpu())
+            batch_size = len(genes)
+            batch_indices = list(range(batch_start_idx, batch_start_idx + batch_size))
+            all_gene_indices.extend(batch_indices)
+            batch_start_idx += batch_size
             
             predicted = (torch.sigmoid(predictions) > 0.5).cpu().numpy()
             preds.extend(predicted)
@@ -161,24 +178,14 @@ def gather_latent_space(model, data_loader, device, pathway_data=None):
     all_labels = []
     
     with torch.no_grad():
-        for genes, labels in data_loader:
+        for genes, disease_counts, labels in data_loader: 
             genes = genes.to(device)
-            gene_embed = model.gene_enc(genes)
-            if gene_embed.dim() == 3:
-                if gene_embed.size(1) == 1:
-                    gene_embed = gene_embed.squeeze(1)
-                else:
-                    gene_embed = gene_embed.mean(dim=1)
-                    
-            path_embed = model.pathway_enc(pathway_data)
-            if path_embed.dim() == 1:
-                path_embed = path_embed.unsqueeze(0)
-            if path_embed.size(0) == 1 and gene_embed.size(0) > 1:
-                path_embed = path_embed.expand(gene_embed.size(0), -1)
+            disease_counts = disease_counts.to(device)
+            predictions, attn_weights, latent = model(genes, pathway_data, disease_counts=disease_counts)
             
-            combined = torch.cat([gene_embed, path_embed], dim=1)
-            all_embeddings.append(combined.cpu().numpy())
+            all_embeddings.append(latent.cpu().numpy())
             all_labels.append(labels.numpy())
+            
     all_embeddings = np.vstack(all_embeddings) if all_embeddings else np.array([])
     all_labels = np.concatenate(all_labels) if all_labels else np.array([])
     
@@ -194,24 +201,14 @@ def visualize_all_genes(model, train_loader, val_loader, device, pathway_data, g
     
     model.eval()
     with torch.no_grad():
-        for genes, labels in full_loader:
+        for genes, disease_counts, labels in full_loader:  
             genes = genes.to(device)
-            gene_embed = model.gene_enc(genes)
-            if gene_embed.dim() == 3:
-                if gene_embed.size(1) == 1:
-                    gene_embed = gene_embed.squeeze(1)
-                else:
-                    gene_embed = gene_embed.mean(dim=1)
-                    
-            path_embed = model.pathway_enc(pathway_data)
-            if path_embed.dim() == 1:
-                path_embed = path_embed.unsqueeze(0)
-            if path_embed.size(0) == 1 and gene_embed.size(0) > 1:
-                path_embed = path_embed.expand(gene_embed.size(0), -1)
-                
-            combined = torch.cat([gene_embed, path_embed], dim=1)
+            disease_counts = disease_counts.to(device)
+            _, _, combined = model(genes, pathway_data, disease_counts=disease_counts)
+            
             embeddings = combined.cpu().numpy()
             label_values = labels.cpu().numpy()
+            
             visualize_latent_space(
                 embeddings, 
                 label_values, 
@@ -220,8 +217,32 @@ def visualize_all_genes(model, train_loader, val_loader, device, pathway_data, g
             )
             break
 
+def visualize_all_gene_attention(model, train_loader, val_loader, device, pathway_data, 
+                                pathway_node_names, gene_names, epoch, save_dir="results", suffix=""):
+    print("Creating comprehensive attention visualization for all genes...")
+    
+    full_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
+    full_loader = DataLoader(full_dataset, batch_size=len(full_dataset), shuffle=False)
+    
+    model.eval()
+    with torch.no_grad():
+        for genes, disease_counts, labels in full_loader:
+            genes = genes.to(device)
+            disease_counts = disease_counts.to(device)
+            _, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
+            
+            print(f"Visualizing attention for all {len(genes)} genes")
+            visualize_attention(
+                attn_weights,
+                gene_names,
+                pathway_node_names,
+                epoch,
+                save_dir=save_dir,
+                suffix=suffix
+            )
+            break
+
 def main(args: Dict, preloaded_pathway_data=None) -> None:
-    """Main training function"""
     check_cuda()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs("results", exist_ok=True)
@@ -249,36 +270,79 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
     optimizer = optim.AdamW(model.parameters(), lr=2e-5)
     scaler = GradScaler()
     criterion = HybridLoss()
+    pathway_node_names = []
+    if hasattr(pathway_data, 'node_names'):
+        pathway_node_names = pathway_data.node_names
+    elif hasattr(pathway_data, 'names'):
+        pathway_node_names = pathway_data.names
+    else:
+        pathway_node_names = [f"Node_{i+1}" for i in range(pathway_data.x.shape[0])]
     
     with open("results/training_log.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_loss", "val_accuracy", "val_precision", "val_recall", "val_f1"])
 
     best_val_loss = float('inf')
-    patience = 5
     patience_counter = 0
-    accumulation_steps = args.accumulation_steps
-
+    patience = 5 
+    is_best = False
+    
     for epoch in range(args.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, accumulation_steps)
-        val_loss, accuracy, precision, recall, f1 = evaluate(model, val_loader, device, pathway_data, criterion)
-        with open("results/training_log.csv", "a", newline="", encoding="utf-8") as f:
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, args.accumulation_steps)
+        is_final = (epoch == args.epochs - 1)
+        
+        val_loss, accuracy, precision, recall, f1 = evaluate(
+            model, val_loader, device, pathway_data, criterion, 
+            epoch=epoch, pathway_node_names=pathway_node_names, gene_names=gene_names,
+            is_best=is_best, final_epoch=is_final
+        )
+        with open(os.path.join(args.output_dir, 'training_log.csv'), 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([epoch, train_loss, val_loss, accuracy, precision, recall, f1])
         
         print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        is_best = False
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), "results/best_model.pt")
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
+            is_best = True
+            
+            if pathway_node_names is not None and gene_names is not None:
+                print("Generating visualizations for best model...")
+                visualize_all_gene_attention(
+                    model,
+                    train_loader,
+                    val_loader,
+                    device, 
+                    pathway_data,
+                    pathway_node_names,
+                    gene_names,
+                    epoch,
+                    save_dir="results",
+                    suffix="_best"
+                )
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
+        
         if epoch % 5 == 0:  
             all_embeddings, all_labels = gather_latent_space(model, val_loader, device, pathway_data)
             visualize_latent_space(all_embeddings, all_labels, gene_names=gene_names)
+            if not pathway_node_names:  
+                pathway_node_names = [f"Node_{i}" for i in range(pathway_data.x.shape[0])]
+                
+            visualize_all_gene_attention(
+                model, train_loader, val_loader, device, 
+                pathway_data, pathway_node_names, gene_names, epoch
+            )
+    evaluate(
+        model, val_loader, device, pathway_data, criterion, 
+        epoch=args.epochs, pathway_node_names=pathway_node_names, gene_names=gene_names,
+        is_best=False, final_epoch=True
+    )
     visualize_all_genes(model, train_loader, val_loader, device, pathway_data, gene_names)
 
 def create_final_visualization(args):
@@ -328,6 +392,7 @@ if __name__ == "__main__":
     parser.add_argument("--kegg_id", type=str, default="hsa03440", help="KEGG pathway ID to download")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--output_dir", type=str, default="results", help="Directory to save outputs")
     
     args = parser.parse_args()
     pathway_data = None
