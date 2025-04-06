@@ -11,6 +11,7 @@ from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr
 from torch_geometric.data.graph_store import EdgeLayout
 from torch_geometric.data.storage import GlobalStorage, EdgeStorage, NodeStorage
 import os
+import math
 add_safe_globals([
     Data, 
     DataTensorAttr, 
@@ -102,23 +103,40 @@ class PathwayGNN(nn.Module):
         return x
 
 class CrossModalAttentionLayer(nn.Module):
-    def __init__(self, gene_dim, pathway_dim, attn_dim):
+    def __init__(self, gene_dim, pathway_dim, attn_dim, dropout=0.2):
         super().__init__()
         self.query_proj = nn.Linear(gene_dim, attn_dim)
         self.key_proj = nn.Linear(pathway_dim, attn_dim)
         self.value_proj = nn.Linear(pathway_dim, attn_dim)
+        self.layer_norm1 = nn.LayerNorm(attn_dim)
+        self.layer_norm2 = nn.LayerNorm(attn_dim)
+        self.dropout = nn.Dropout(dropout)  
         self.softmax = nn.Softmax(dim=-1)
+        self.gene_attn_bias = nn.Linear(gene_dim, attn_dim)
+        nn.init.xavier_normal_(self.query_proj.weight)
+        nn.init.xavier_normal_(self.key_proj.weight)
+        self.scale_factor = 1.0 / (attn_dim ** 0.5)
     
     def forward(self, gene_embedding, pathway_node_features):
         batch_size = gene_embedding.size(0)
+        num_nodes = pathway_node_features.size(0)
+        Q = self.query_proj(gene_embedding)  
+        Q = self.layer_norm1(Q).unsqueeze(1)  
+        gene_bias = self.gene_attn_bias(gene_embedding) 
         pathway_nodes = pathway_node_features.unsqueeze(0).expand(batch_size, -1, -1)
-        Q = self.query_proj(gene_embedding).unsqueeze(1)
-        K = self.key_proj(pathway_nodes)
+        K_base = self.key_proj(pathway_nodes) 
+        bias_expanded = gene_bias.unsqueeze(1).expand(-1, num_nodes, -1)
+        K = self.layer_norm2(K_base + 0.1 * bias_expanded)
+        
         V = self.value_proj(pathway_nodes)
-        scores = torch.matmul(Q, K.transpose(1, 2))
-        attn_weights = self.softmax(scores)
-        attn_output = torch.matmul(attn_weights, V)
-        return attn_output.squeeze(1), attn_weights.squeeze(1)
+        attn_scores = torch.bmm(Q, K.transpose(1, 2)) * self.scale_factor
+        if self.training:
+            noise = torch.randn_like(attn_scores) * 0.1
+            attn_scores = attn_scores + noise
+        attn_weights = self.dropout(self.softmax(attn_scores))
+        context = torch.bmm(attn_weights, V).squeeze(1)
+        
+        return context, attn_weights.squeeze(1)
 
 class FusionModel(nn.Module):
     def __init__(self, gene_dim: int = 256, pathway_dim: int = 256, 

@@ -163,6 +163,25 @@ def attention_heatmap(attn_weights, gene_names, node_names, filename="heatmap.pn
     plt.savefig(filename)
     plt.close()
 
+def extract_original_genes_only(gene_names, embeddings):
+    original_indices = []
+    original_names = []
+    
+    for i, name in enumerate(gene_names):
+        if "_aug" not in name:
+            if i < len(embeddings):
+                original_indices.append(i)
+                original_names.append(name)
+    
+    if original_indices:
+        if isinstance(embeddings, torch.Tensor):
+            original_embeddings = embeddings[original_indices]
+        else:  
+            original_embeddings = embeddings[original_indices]
+        return original_names, original_embeddings
+    else:
+        return [], None
+
 def visualize_attention_for_all_genes(model, dataset, device, pathway_data, pathway_node_names, gene_names, epoch, save_dir="results"):
     model.eval()
     full_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
@@ -244,3 +263,33 @@ def visualize_attention_for_original_genes(model, dataset, device, pathway_data,
                 save_dir=save_dir,
                 suffix="_original_only"
             )
+
+def visualize_original_genes_attention(model, dataset, device, pathway_data, pathway_node_names, gene_names, save_dir="results"):
+    print("Creating attention visualization for original genes only...")
+    original_names = [name for name in gene_names if "_aug" not in name]
+    loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+    
+    model.eval()
+    with torch.no_grad():
+        for genes, disease_counts, labels in loader:
+            genes = genes.to(device)
+            disease_counts = disease_counts.to(device)
+            _, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
+            original_indices = [i for i, name in enumerate(gene_names) if "_aug" not in name and i < len(attn_weights)]
+            
+            if not original_indices:
+                print("ERROR: Couldn't find original genes in the batch")
+                return
+                
+            original_attn = attn_weights[original_indices]
+            
+            print(f"Visualizing attention for {len(original_indices)} original genes")
+            visualize_attention(
+                original_attn,
+                [gene_names[i] for i in original_indices],
+                pathway_node_names,
+                0,  
+                save_dir=save_dir,
+                suffix="_original_only"
+            )
+            break

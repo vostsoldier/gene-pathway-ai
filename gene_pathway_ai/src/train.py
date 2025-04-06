@@ -18,9 +18,34 @@ import seaborn as sns
 from data_loader import load_gene_sequences, load_pathway_graph, load_genes_from_dir
 from model import FusionModel
 from utils import seq_to_onehot, check_cuda
-from visualize import visualize_latent_space, visualize_attention, visualize_attention_for_all_genes, visualize_attention_for_original_genes
+from visualize import visualize_latent_space, visualize_attention, visualize_attention_for_all_genes, visualize_attention_for_original_genes, visualize_original_genes_attention
 from losses import HybridLoss
+import torch.nn as nn
+import torch.nn.functional as F
 
+class DiversityRegularizedLoss(nn.Module):
+    def __init__(self, base_criterion=nn.BCEWithLogitsLoss(), diversity_weight=0.5):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.diversity_weight = diversity_weight
+        
+    def forward(self, predictions, targets, attention_weights=None):
+        base_loss = self.base_criterion(predictions, targets)
+        if attention_weights is not None and self.diversity_weight > 0:
+            batch_size = attention_weights.size(0)
+            if batch_size > 1:
+                norm_weights = F.normalize(attention_weights, p=2, dim=1)
+                similarity_matrix = torch.mm(norm_weights, norm_weights.transpose(0, 1))
+                identity = torch.eye(batch_size, device=attention_weights.device)
+                similarity_matrix = similarity_matrix * (1 - identity)
+                mean_similarity = similarity_matrix.sum() / (batch_size * (batch_size - 1))
+                return base_loss + self.diversity_weight * mean_similarity
+            else:
+                entropy = -torch.sum(attention_weights * torch.log(attention_weights + 1e-10))
+                return base_loss - 0.01 * entropy
+        
+        return base_loss
+    
 def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded_pathway_data = None) -> Tuple[DataLoader, DataLoader, torch.Tensor, List[str], torch.Tensor]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     from ensembl_api import get_gene_disease_associations
@@ -144,21 +169,34 @@ def prepare_data(pos_dir: str, neg_dir: str, pathway_file: str = None, preloaded
     
     return train_loader, val_loader, pathway_data, gene_names
 
-def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, accumulation_steps):
+def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, pathway_data, accumulation_steps=1):
     model.train()
-    optimizer.zero_grad()
     total_loss = 0.0
+    steps = 0
     
-    for i, (genes, disease_counts, labels) in enumerate(train_loader):
-        genes, disease_counts, labels = genes.to(device), disease_counts.to(device), labels.to(device)
+    for idx, (genes, disease_counts, labels) in enumerate(train_loader):
+        genes = genes.to(device)
+        disease_counts = disease_counts.to(device)
+        labels = labels.to(device)
         with autocast():
-            predictions, attn_weights, latent = model(genes, pathway_data, disease_counts=disease_counts)
+            predictions, attn_weights, _ = model(genes, pathway_data, disease_counts=disease_counts)
             loss = criterion(predictions, labels, attn_weights)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-        total_loss += loss.item() * genes.size(0)
+        loss = loss / accumulation_steps
+        scaler.scale(loss).backward()
+        if idx % accumulation_steps == 0 or idx == len(train_loader) - 1:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
         
+        total_loss += loss.item() * genes.size(0) * accumulation_steps
+        steps += 1
+        if loss.item() < 1e-6:
+            print("Warning: Loss approaching zero too quickly. Adding regularization.")
+            for param in model.parameters():
+                if param.requires_grad:
+                    loss = loss + 0.01 * torch.norm(param)
+    
     return total_loss / len(train_loader.dataset)
 
 def evaluate(model, val_loader, device, pathway_data, criterion, epoch=None, 
@@ -276,6 +314,48 @@ def visualize_all_gene_attention(model, train_loader, val_loader, device, pathwa
             )
             break
 
+def process_all_genes_for_visualization(model, train_loader, val_loader, device, pathway_data, gene_names):
+    print("Processing all genes for visualization...")
+    all_genes = []
+    all_disease_counts = []
+    all_labels = []
+    gene_names_ordered = []
+    seen_genes = set()
+    for batch_idx, (genes, disease_counts, labels) in enumerate(train_loader):
+        for i in range(len(genes)):
+            if batch_idx * train_loader.batch_size + i < len(gene_names):
+                gene_name = gene_names[batch_idx * train_loader.batch_size + i] 
+                if gene_name not in seen_genes:  
+                    seen_genes.add(gene_name)
+                    gene_names_ordered.append(gene_name)
+                    all_genes.append(genes[i])
+                    all_disease_counts.append(disease_counts[i])
+                    all_labels.append(labels[i])
+
+    for batch_idx, (genes, disease_counts, labels) in enumerate(val_loader):
+        for i in range(len(genes)):
+            idx = len(train_loader.dataset) + batch_idx * val_loader.batch_size + i
+            if idx < len(gene_names):
+                gene_name = gene_names[idx]
+                if gene_name not in seen_genes: 
+                    seen_genes.add(gene_name)
+                    gene_names_ordered.append(gene_name)
+                    all_genes.append(genes[i])
+                    all_disease_counts.append(disease_counts[i])
+                    all_labels.append(labels[i])
+    
+    genes_tensor = torch.stack(all_genes).to(device)
+    disease_counts_tensor = torch.stack(all_disease_counts).to(device)
+    labels_tensor = torch.stack(all_labels).to(device)
+    model.eval()
+    with torch.no_grad():
+        _, attn_weights, embeddings = model(genes_tensor, pathway_data, disease_counts=disease_counts_tensor)
+    
+    print(f"Successfully processed {len(gene_names_ordered)} genes")
+    print(f"Attention weights shape: {attn_weights.shape}")
+    print(f"Embeddings shape: {embeddings.shape}")
+    return attn_weights, embeddings, labels_tensor, gene_names_ordered
+
 def main(args: Dict, preloaded_pathway_data=None) -> None:
     check_cuda()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -302,11 +382,11 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
     
     print(f"Model initialized with sequence length {seq_len} and {pathway_feat_dim} pathway features")
     from torch.optim.lr_scheduler import ReduceLROnPlateau
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01) 
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)  # Reduce learning rate
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
     
     scaler = GradScaler()
-    criterion = HybridLoss()
+    criterion = DiversityRegularizedLoss()
     pathway_node_names = []
     if hasattr(pathway_data, 'node_names'):
         pathway_node_names = pathway_data.node_names
@@ -347,19 +427,44 @@ def main(args: Dict, preloaded_pathway_data=None) -> None:
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
             is_best = True
             
-            if pathway_node_names is not None and gene_names is not None:
+            if pathway_node_names is not None:
                 print("Generating visualizations for best model...")
-                full_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
-                visualize_attention_for_original_genes(
-                    model,
-                    full_dataset,
+                
+                attn_weights, embeddings, labels, matched_gene_names = process_all_genes_for_visualization(
+                    model, 
+                    train_loader, 
+                    val_loader, 
                     device, 
                     pathway_data,
-                    pathway_node_names,
-                    gene_names,
-                    epoch,
-                    save_dir="results"
+                    gene_names
                 )
+                
+                visualize_attention(
+                    attn_weights,
+                    matched_gene_names,
+                    pathway_node_names,
+                    epoch,
+                    save_dir="results",
+                    suffix="_best"
+                )
+                
+                visualize_latent_space(
+                    embeddings.cpu().numpy(),
+                    labels.cpu().numpy(),
+                    gene_names=matched_gene_names,
+                    filename="results/best_umap.png"
+                )
+            
+            full_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
+            visualize_original_genes_attention(
+                model,
+                full_dataset,
+                device,
+                pathway_data,
+                pathway_node_names,
+                gene_names,
+                save_dir="results"
+            )
         else:
             patience_counter += 1
             if patience_counter >= patience:
